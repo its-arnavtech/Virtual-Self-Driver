@@ -93,8 +93,8 @@ def save_histograms(raw, balanced, train_angles, out_path):
 
 def save_loss_plot(history, out_path):
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(history["loss"], label="training loss")
-    ax.plot(history["val_loss"], label="validation loss")
+    ax.plot(history["epoch"], history["loss"], label="training loss")
+    ax.plot(history["epoch"], history["val_loss"], label="validation loss")
     ax.set_xlabel("epoch")
     ax.set_ylabel("mean squared error")
     ax.legend()
@@ -115,6 +115,8 @@ def main():
     p.add_argument("--camera-correction", type=float, default=0.15)
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--patience", type=int, default=15, help="stop after this many epochs without improvement")
+    p.add_argument("--resume", help="continue training from a saved model (e.g. models/model.keras)")
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -140,27 +142,54 @@ def main():
     x_val = np.stack([preprocess(load_rgb(p)) for p in val_df["center"]])
     y_val = val_df["steering"].to_numpy(dtype=np.float32)
 
-    model = build_nvidia_model(args.lr)
+    log_path = os.path.join(args.out, "training_log.csv")
+    best_path = os.path.join(args.out, "model.keras")
+    if args.resume:
+        print(f"Resuming from {args.resume}")
+        model = keras.models.load_model(args.resume)
+        model.optimizer.learning_rate.assign(args.lr)
+        start_val = float(model.evaluate(x_val, y_val, verbose=0))
+        prev_log = pd.read_csv(log_path) if os.path.exists(log_path) else pd.DataFrame()
+        print(f"Starting validation loss: {start_val:.5f}")
+    else:
+        model = build_nvidia_model(args.lr)
+        start_val, prev_log = np.inf, pd.DataFrame()
+    initial_epoch = len(prev_log)
     model.summary()
 
-    best_path = os.path.join(args.out, "model.keras")
+    def log_epoch(epoch, logs):
+        row = {"epoch": epoch, "loss": logs["loss"], "val_loss": logs["val_loss"],
+               "learning_rate": float(model.optimizer.learning_rate.numpy())}
+        nonlocal prev_log
+        prev_log = pd.concat([prev_log, pd.DataFrame([row])], ignore_index=True)
+        prev_log.to_csv(log_path, index=False)
+
     callbacks = [
-        keras.callbacks.ModelCheckpoint(best_path, monitor="val_loss", save_best_only=True, verbose=1),
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
-        keras.callbacks.CSVLogger(os.path.join(args.out, "training_log.csv")),
+        # Only overwrite the saved model when validation loss beats everything so far
+        # (including the model we resumed from).
+        keras.callbacks.ModelCheckpoint(
+            best_path, monitor="val_loss", save_best_only=True, initial_value_threshold=start_val, verbose=1
+        ),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience, verbose=1),
+        # When validation stops improving, take smaller steps to fine-tune.
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
+        keras.callbacks.LambdaCallback(on_epoch_end=log_epoch),
     ]
-    history = model.fit(
-        batch_generator(train_images, train_angles, args.batch_size, rng),
+    # Fresh randomness for augmentation on every resumed run.
+    batch_rng = np.random.default_rng([args.seed, initial_epoch])
+    model.fit(
+        batch_generator(train_images, train_angles, args.batch_size, batch_rng),
         steps_per_epoch=args.steps_per_epoch,
-        epochs=args.epochs,
+        initial_epoch=initial_epoch,
+        epochs=initial_epoch + args.epochs,
         validation_data=(x_val, y_val),
         callbacks=callbacks,
         verbose=2,
     )
 
-    model.save(best_path)  # best weights, restored by EarlyStopping
+    model = keras.models.load_model(best_path)  # the best epoch ever, not the last one
     model.save(os.path.join(args.out, "model.h5"))  # legacy format for older drive.py scripts
-    save_loss_plot(history.history, os.path.join(args.out, "loss.png"))
+    save_loss_plot(prev_log, os.path.join(args.out, "loss.png"))
 
     pred = model.predict(x_val, verbose=0).ravel()
     baseline = float(np.mean((y_val - y_val.mean()) ** 2))  # "always predict the average angle"
@@ -169,8 +198,9 @@ def main():
         "frames_after_balancing": int(len(df)),
         "train_samples": int(len(train_paths)),
         "val_samples": int(len(val_df)),
-        "epochs_run": len(history.history["loss"]),
-        "best_val_mse": float(min(history.history["val_loss"])),
+        "epochs_total": int(len(prev_log)),
+        "best_epoch": int(prev_log["val_loss"].idxmin()),
+        "best_val_mse": float(prev_log["val_loss"].min()),
         "val_mae": float(np.mean(np.abs(pred - y_val))),
         "baseline_val_mse_constant_prediction": baseline,
         "args": vars(args),

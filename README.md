@@ -72,6 +72,7 @@ pip install -r requirements.txt
 python train.py                                   # starter dataset
 python train.py --data data/my_lap1 data/my_lap2  # your own simulator recordings (combined)
 python train.py --help                            # epochs, learning rate, camera correction, ...
+python train.py --resume models/model.keras --epochs 50  # keep training an existing model
 ```
 
 Outputs go to `models/`:
