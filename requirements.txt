@@ -1,0 +1,13 @@
+# Build + Train
+tensorflow>=2.16
+numpy
+pandas
+opencv-python-headless
+matplotlib
+
+# Drive (talk to the Udacity simulator in autonomous mode)
+python-socketio==4.6.1
+python-engineio==3.13.2
+flask
+eventlet
+pillow
