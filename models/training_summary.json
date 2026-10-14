@@ -3,22 +3,25 @@
   "frames_after_balancing": 1463,
   "train_samples": 3513,
   "val_samples": 292,
-  "epochs_run": 30,
-  "best_val_mse": 0.032544586807489395,
-  "val_mae": 0.1344013214111328,
+  "epochs_total": 100,
+  "best_epoch": 89,
+  "best_val_mse": 0.021950170397758484,
+  "val_mae": 0.11465485394001007,
   "baseline_val_mse_constant_prediction": 0.11097194999456406,
   "args": {
     "data": [
       "data/track"
     ],
     "out": "models",
-    "epochs": 30,
+    "epochs": 70,
     "steps_per_epoch": 300,
     "batch_size": 100,
     "lr": 0.0001,
     "max_per_bin": 400,
     "camera_correction": 0.15,
     "val_split": 0.2,
-    "seed": 0
+    "seed": 0,
+    "patience": 15,
+    "resume": "models/model.keras"
   }
 }
