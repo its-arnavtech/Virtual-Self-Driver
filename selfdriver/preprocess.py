@@ -20,6 +20,11 @@ def load_rgb(path: str) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def decode_rgb(jpeg: np.ndarray) -> np.ndarray:
+    """Decode an in-memory JPEG (uint8 buffer) to an RGB image, same pixels as load_rgb."""
+    return cv2.cvtColor(cv2.imdecode(jpeg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+
+
 def preprocess(rgb: np.ndarray) -> np.ndarray:
     """160x320 RGB uint8 -> 66x200 YUV uint8 (normalization happens inside the model)."""
     img = rgb[CROP_TOP:CROP_BOTTOM, :, :]

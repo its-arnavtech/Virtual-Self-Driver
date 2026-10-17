@@ -1,6 +1,6 @@
 """Step 3: TRAIN. Teach the NVIDIA network to steer from recorded driving.
 
-    python train.py                         # uses data/track (scripts/download_data.sh)
+    python train.py                         # uses data/track (scripts/download_data.py)
     python train.py --data path/to/my_sim_recording --epochs 30
 
 A data folder is whatever the Udacity simulator writes in Training Mode:
@@ -22,7 +22,7 @@ import pandas as pd
 from tensorflow import keras
 
 from selfdriver.model import build_nvidia_model
-from selfdriver.preprocess import augment, load_rgb, preprocess
+from selfdriver.preprocess import augment, decode_rgb, load_rgb, preprocess
 
 COLUMNS = ["center", "left", "right", "steering", "throttle", "brake", "speed"]
 
@@ -40,10 +40,15 @@ def load_log(data_dir: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def balance(df: pd.DataFrame, bins: int, max_per_bin: int, rng) -> pd.DataFrame:
+def balance(df: pd.DataFrame, bins: int, max_per_bin, rng) -> pd.DataFrame:
     """Humans drive straight most of the time, so most rows have steering == 0.
     Left as is, the network learns that "always go straight" is nearly always
-    right. Cap how many samples any steering range may contribute."""
+    right. Cap how many samples any steering range may contribute.
+
+    max_per_bin=None scales the cap with the dataset (2.5x the average bin), so
+    recording more laps keeps adding training data instead of being thrown away."""
+    if max_per_bin is None:
+        max_per_bin = max(1, int(2.5 * len(df) / bins))
     edges = np.linspace(-1, 1, bins + 1)
     which = np.clip(np.digitize(df["steering"], edges) - 1, 0, bins - 1)
     keep = []
@@ -52,6 +57,21 @@ def balance(df: pd.DataFrame, bins: int, max_per_bin: int, rng) -> pd.DataFrame:
         rng.shuffle(idx)
         keep.extend(idx[:max_per_bin])
     return df.iloc[sorted(keep)].reset_index(drop=True)
+
+
+def split_by_blocks(df: pd.DataFrame, val_split: float, block_size: int, rng):
+    """Split into train/validation by stretches of driving, not single frames.
+
+    The simulator records ~14 frames a second, so neighbouring frames are nearly
+    identical. Shuffling single frames would put a near-copy of most validation
+    images into the training set and make the validation score look better than
+    the car really is. Whole blocks of consecutive frames go to one side instead.
+    `df` must carry a "frame" column with each row's position in the recording."""
+    blocks = (df["frame"] // block_size).to_numpy()
+    unique = rng.permutation(np.unique(blocks))
+    n_val = max(1, round(len(unique) * val_split))
+    is_val = np.isin(blocks, unique[:n_val])
+    return df[is_val], df[~is_val]
 
 
 def expand_cameras(df: pd.DataFrame, correction: float):
@@ -63,17 +83,36 @@ def expand_cameras(df: pd.DataFrame, correction: float):
     return paths, np.clip(angles, -1.0, 1.0).astype(np.float32)
 
 
-def batch_generator(images, angles, batch_size, rng):
-    n = len(images)
+def batch_generator(jpegs, angles, batch_size, rng):
+    """`jpegs` holds the compressed files; each image is decoded only when used."""
+    n = len(jpegs)
     while True:
         idx = rng.integers(0, n, batch_size)
         x = np.empty((batch_size, 66, 200, 3), dtype=np.uint8)
         y = np.empty(batch_size, dtype=np.float32)
         for i, j in enumerate(idx):
-            img, angle = augment(images[j], angles[j], rng)
+            img, angle = augment(decode_rgb(jpegs[j]), angles[j], rng)
             x[i] = preprocess(img)
             y[i] = angle
         yield x, y
+
+
+class EpochLogger(keras.callbacks.Callback):
+    """Appends one row per epoch to training_log.csv (continuing an existing log
+    when resuming), with the learning rate that epoch actually trained at."""
+
+    def __init__(self, path: str, previous: pd.DataFrame):
+        super().__init__()
+        self.path, self.log, self._lr = path, previous, None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        # Read the rate now: ReduceLROnPlateau may lower it at the end of the epoch.
+        self._lr = float(keras.ops.convert_to_numpy(self.model.optimizer.learning_rate))
+
+    def on_epoch_end(self, epoch, logs=None):
+        row = {"epoch": epoch, "loss": logs["loss"], "val_loss": logs["val_loss"], "learning_rate": self._lr}
+        self.log = pd.concat([self.log, pd.DataFrame([row])], ignore_index=True)
+        self.log.to_csv(self.path, index=False)
 
 
 def save_histograms(raw, balanced, train_angles, out_path):
@@ -111,9 +150,10 @@ def main():
     p.add_argument("--steps-per-epoch", type=int, default=300)
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--max-per-bin", type=int, default=400)
+    p.add_argument("--max-per-bin", type=int, default=None, help="cap per steering bin (default: scales with the data)")
     p.add_argument("--camera-correction", type=float, default=0.15)
     p.add_argument("--val-split", type=float, default=0.2)
+    p.add_argument("--val-block", type=int, default=50, help="consecutive frames kept together when splitting")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--patience", type=int, default=15, help="stop after this many epochs without improvement")
     p.add_argument("--resume", help="continue training from a saved model (e.g. models/model.keras)")
@@ -124,21 +164,22 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     df = pd.concat([load_log(d) for d in args.data], ignore_index=True)
+    df["frame"] = np.arange(len(df))  # position in the recording, used for the split
     raw_angles = df["steering"].to_numpy()
     df = balance(df, bins=25, max_per_bin=args.max_per_bin, rng=rng)
     print(f"Recorded frames: {len(raw_angles)}   after balancing: {len(df)}")
 
-    # Split by frame, so no moment appears in both training and validation.
-    order = rng.permutation(len(df))
-    n_val = int(len(df) * args.val_split)
-    val_df, train_df = df.iloc[order[:n_val]], df.iloc[order[n_val:]]
+    val_df, train_df = split_by_blocks(df, args.val_split, args.val_block, rng)
 
     train_paths, train_angles = expand_cameras(train_df, args.camera_correction)
     print(f"Training samples: {len(train_paths)} (center+left+right)   validation samples: {len(val_df)} (center)")
     save_histograms(raw_angles, df["steering"], train_angles, os.path.join(args.out, "steering_histogram.png"))
 
     print("Loading images into memory...")
-    train_images = [load_rgb(p) for p in train_paths]
+    train_jpegs = []
+    for path in train_paths:
+        with open(path, "rb") as f:
+            train_jpegs.append(np.frombuffer(f.read(), dtype=np.uint8))
     x_val = np.stack([preprocess(load_rgb(p)) for p in val_df["center"]])
     y_val = val_df["steering"].to_numpy(dtype=np.float32)
 
@@ -148,6 +189,10 @@ def main():
         print(f"Resuming from {args.resume}")
         model = keras.models.load_model(args.resume)
         model.optimizer.learning_rate.assign(args.lr)
+        if os.path.abspath(args.resume) != os.path.abspath(best_path):
+            # The checkpoint below only writes when an epoch improves on this model,
+            # so make sure the "best so far" file starts out as the resumed model.
+            model.save(best_path)
         start_val = float(model.evaluate(x_val, y_val, verbose=0))
         prev_log = pd.read_csv(log_path) if os.path.exists(log_path) else pd.DataFrame()
         print(f"Starting validation loss: {start_val:.5f}")
@@ -157,13 +202,7 @@ def main():
     initial_epoch = len(prev_log)
     model.summary()
 
-    def log_epoch(epoch, logs):
-        row = {"epoch": epoch, "loss": logs["loss"], "val_loss": logs["val_loss"],
-               "learning_rate": float(model.optimizer.learning_rate.numpy())}
-        nonlocal prev_log
-        prev_log = pd.concat([prev_log, pd.DataFrame([row])], ignore_index=True)
-        prev_log.to_csv(log_path, index=False)
-
+    epoch_logger = EpochLogger(log_path, prev_log)
     callbacks = [
         # Only overwrite the saved model when validation loss beats everything so far
         # (including the model we resumed from).
@@ -173,12 +212,12 @@ def main():
         keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience, verbose=1),
         # When validation stops improving, take smaller steps to fine-tune.
         keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
-        keras.callbacks.LambdaCallback(on_epoch_end=log_epoch),
+        epoch_logger,
     ]
     # Fresh randomness for augmentation on every resumed run.
     batch_rng = np.random.default_rng([args.seed, initial_epoch])
     model.fit(
-        batch_generator(train_images, train_angles, args.batch_size, batch_rng),
+        batch_generator(train_jpegs, train_angles, args.batch_size, batch_rng),
         steps_per_epoch=args.steps_per_epoch,
         initial_epoch=initial_epoch,
         epochs=initial_epoch + args.epochs,
@@ -189,7 +228,8 @@ def main():
 
     model = keras.models.load_model(best_path)  # the best epoch ever, not the last one
     model.save(os.path.join(args.out, "model.h5"))  # legacy format for older drive.py scripts
-    save_loss_plot(prev_log, os.path.join(args.out, "loss.png"))
+    log = epoch_logger.log
+    save_loss_plot(log, os.path.join(args.out, "loss.png"))
 
     pred = model.predict(x_val, verbose=0).ravel()
     baseline = float(np.mean((y_val - y_val.mean()) ** 2))  # "always predict the average angle"
@@ -198,9 +238,9 @@ def main():
         "frames_after_balancing": int(len(df)),
         "train_samples": int(len(train_paths)),
         "val_samples": int(len(val_df)),
-        "epochs_total": int(len(prev_log)),
-        "best_epoch": int(prev_log["val_loss"].idxmin()),
-        "best_val_mse": float(prev_log["val_loss"].min()),
+        "epochs_total": int(len(log)),
+        "best_epoch": int(log["val_loss"].idxmin()),
+        "best_val_mse": float(log["val_loss"].min()),
         "val_mae": float(np.mean(np.abs(pred - y_val))),
         "baseline_val_mse_constant_prediction": baseline,
         "args": vars(args),

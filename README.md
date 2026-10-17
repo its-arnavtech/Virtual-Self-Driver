@@ -12,7 +12,7 @@ There are three steps: **drive, build, train.**
 
 | Step | What happens | File |
 |---|---|---|
-| **Drive** (record) | A human drives in the simulator's *Training Mode*, which logs camera frames + steering angle | `scripts/download_data.sh` fetches a ready-made recording |
+| **Drive** (record) | A human drives in the simulator's *Training Mode*, which logs camera frames + steering angle | `scripts/download_data.py` fetches a ready-made recording |
 | **Build** | The 9-layer NVIDIA network | `selfdriver/model.py` |
 | **Train** | Show it the frames and angles until it can predict the angle itself | `train.py` |
 | **Drive** (autonomous) | The trained network steers the car in the simulator's *Autonomous Mode* | `drive.py` |
@@ -50,20 +50,24 @@ It uses exactly the format the simulator writes, so your own recordings work wit
 How the data is prepared (`train.py`):
 
 1. **Balance.** About 72% of the frames have a steering angle of exactly 0, because people mostly
-   drive straight. Each of 25 steering ranges is capped at 400 frames, so the network can't get
-   away with always going straight. See `models/steering_histogram.png`.
+   drive straight. Each of 25 steering ranges is capped (about 400 frames for the starter data;
+   the cap grows with the amount of data), so the network can't get away with always going
+   straight. See `models/steering_histogram.png`.
 2. **Use all 3 cameras.** The left and right cameras see the road as if the car had drifted
    sideways. Their labels are adjusted by ±0.15, which teaches the car how to recover.
 3. **Augment.** Each training image gets random zoom, pan, brightness changes and mirroring
    (with the angle mirrored too), so every batch looks a little different.
-4. **Preprocess** (same in training and driving): crop out the sky and bonnet, convert to YUV,
+4. **Honest validation.** 20% of the data is held back to measure the network on road it hasn't
+   trained on. Consecutive frames are nearly identical, so the split takes whole stretches of
+   50 frames (about 3.5 s of driving) instead of single frames.
+5. **Preprocess** (same in training and driving): crop out the sky and bonnet, convert to YUV,
    apply a slight blur, then resize to 66 × 200.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-./scripts/download_data.sh          # ~350 MB into data/track (git-ignored)
+python scripts/download_data.py     # ~350 MB into data/track (git-ignored), any OS
 ```
 
 ## Train
@@ -83,6 +87,14 @@ Outputs go to `models/`:
 * `training_summary.json`: final metrics
 
 Training runs fine on a CPU (about 1 minute per epoch on 4 cores). A GPU is faster.
+Images stay JPEG-compressed in memory and are decoded on the fly, so several laps of your own
+recordings fit comfortably in RAM.
+
+## Tests
+
+```bash
+python -m pytest tests
+```
 
 ## Record your own data (Drive)
 

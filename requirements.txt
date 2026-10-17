@@ -11,3 +11,6 @@ python-engineio==3.13.2
 flask
 eventlet
 pillow
+
+# Tests (python -m pytest tests)
+pytest
