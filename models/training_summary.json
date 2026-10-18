@@ -1,27 +1,28 @@
 {
   "frames_recorded": 4053,
-  "frames_after_balancing": 1463,
-  "train_samples": 3513,
-  "val_samples": 292,
-  "epochs_total": 100,
-  "best_epoch": 89,
-  "best_val_mse": 0.021950170397758484,
-  "val_mae": 0.11465485394001007,
-  "baseline_val_mse_constant_prediction": 0.11097194999456406,
+  "frames_after_balancing": 1468,
+  "train_samples": 3501,
+  "val_samples": 301,
+  "epochs_total": 30,
+  "best_epoch": 14,
+  "best_val_mse": 0.07594950497150421,
+  "val_mae": 0.1881704181432724,
+  "baseline_val_mse_constant_prediction": 0.1892508864402771,
   "args": {
     "data": [
       "data/track"
     ],
     "out": "models",
-    "epochs": 70,
+    "epochs": 100,
     "steps_per_epoch": 300,
     "batch_size": 100,
     "lr": 0.0001,
-    "max_per_bin": 400,
+    "max_per_bin": null,
     "camera_correction": 0.15,
     "val_split": 0.2,
+    "val_block": 50,
     "seed": 0,
     "patience": 15,
-    "resume": "models/model.keras"
+    "resume": null
   }
 }
